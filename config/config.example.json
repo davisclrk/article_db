@@ -1,0 +1,33 @@
+{
+  "coordinator": {
+    "addr": ":8080",
+    "num_shards": 3,
+    "data_dir": "./data"
+  },
+  "shards": [
+    {
+      "shard_id": 0,
+      "primary_addr": ":9000",
+      "replica_addr": ":9001",
+      "db_path": "./data/shard_0.db"
+    },
+    {
+      "shard_id": 1,
+      "primary_addr": ":9002",
+      "replica_addr": ":9003",
+      "db_path": "./data/shard_1.db"
+    },
+    {
+      "shard_id": 2,
+      "primary_addr": ":9004",
+      "replica_addr": ":9005",
+      "db_path": "./data/shard_2.db"
+    }
+  ],
+  "embedding": {
+    "provider": "openai",
+    "api_key": "your-openai-api-key",
+    "model": "text-embedding-3-small",
+    "dimensions": 1536
+  }
+}
