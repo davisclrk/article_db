@@ -28,6 +28,12 @@ func NewNode(shardID int, isPrimary bool, dbPath string) (*Node, error) {
 	}, nil
 }
 
+func (n *Node) SetReplicaAddr(addr string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.replicaAddr = addr
+}
+
 func (n *Node) Close() error {
 	return n.store.Close()
 }
