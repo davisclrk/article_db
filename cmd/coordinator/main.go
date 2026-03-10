@@ -1,54 +1,164 @@
 package main
 
 import (
-	"flag"
+	"bufio"
+	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
-	"os/signal"
-	"syscall"
+	"strconv"
+	"strings"
 
-	"github.com/davisclrk/article_db/api/server"
-	"github.com/davisclrk/article_db/internal/coordinator"
+	"article_db/internal/config"
+	"article_db/internal/embedding"
+	"article_db/internal/index"
 )
 
 func main() {
-	numShards := flag.Int("shards", 3, "Number of shards")
-	dataDir := flag.String("data-dir", "./data", "Directory for shard databases")
-	addr := flag.String("addr", ":8080", "Server address")
-	flag.Parse()
-
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create data directory: %v\n", err)
-		os.Exit(1)
+	cfg := config.Load()
+	if len(os.Args) > 1 {
+		log.Println("usage: go run ./cmd/coordinator")
+		return
 	}
 
-	cfg := coordinator.Config{
-		NumShards: *numShards,
-		DataDir:   *dataDir,
+	client := embedding.NewClient(cfg.OpenRouterAPIKey, cfg.EmbeddingModel, cfg.OpenRouterBaseURL, nil)
+	localIndex := index.NewLocalIndex()
+
+	fmt.Printf("local vector index ready (model=%s)\n", cfg.EmbeddingModel)
+	printHelp(os.Stdout)
+
+	session := replSession{
+		client: client,
+		index:  localIndex,
+	}
+	if err := session.run(context.Background(), os.Stdin, os.Stdout); err != nil {
+		log.Fatalf("coordinator exited with error: %v", err)
+	}
+}
+
+type replSession struct {
+	client *embedding.Client
+	index  *index.LocalIndex
+	nextID int
+}
+
+func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer) error {
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
+
+	for {
+		fmt.Fprint(output, "article-db> ")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return err
+			}
+			fmt.Fprintln(output)
+			return nil
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		command, rest, _ := strings.Cut(line, " ")
+		switch command {
+		case "insert":
+			if err := s.handleInsert(ctx, strings.TrimSpace(rest), output); err != nil {
+				fmt.Fprintf(output, "error: %v\n", err)
+			}
+		case "query":
+			if err := s.handleQuery(ctx, strings.TrimSpace(rest), output); err != nil {
+				fmt.Fprintf(output, "error: %v\n", err)
+			}
+		case "list":
+			s.handleList(output)
+		case "help":
+			printHelp(output)
+		case "exit", "quit":
+			return nil
+		default:
+			fmt.Fprintf(output, "error: unknown command %q\n", command)
+			printHelp(output)
+		}
+	}
+}
+
+func (s *replSession) handleInsert(ctx context.Context, text string, output io.Writer) error {
+	if text == "" {
+		return fmt.Errorf("usage: insert <text>")
 	}
 
-	coord, err := coordinator.NewCoordinator(cfg)
+	vector, err := s.client.Embed(ctx, text)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create coordinator: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("embedding request failed: %w", err)
 	}
-	defer coord.Close()
 
-	srv := server.NewServer(coord, *addr)
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down...")
-		coord.Close()
-		os.Exit(0)
-	}()
-
-	fmt.Printf("Coordinator starting with %d shards\n", *numShards)
-	if err := srv.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-		os.Exit(1)
+	id := s.nextDocID()
+	if err := s.index.Insert(id, text, vector); err != nil {
+		return err
 	}
+
+	fmt.Fprintf(output, "stored %s dims=%d\n", id, len(vector))
+	return nil
+}
+
+func (s *replSession) handleQuery(ctx context.Context, args string, output io.Writer) error {
+	kToken, text, ok := strings.Cut(args, " ")
+	if !ok || strings.TrimSpace(kToken) == "" || strings.TrimSpace(text) == "" {
+		return fmt.Errorf("usage: query <k> <text>")
+	}
+
+	k, err := strconv.Atoi(strings.TrimSpace(kToken))
+	if err != nil {
+		return fmt.Errorf("invalid k %q", kToken)
+	}
+
+	vector, err := s.client.Embed(ctx, strings.TrimSpace(text))
+	if err != nil {
+		return fmt.Errorf("embedding request failed: %w", err)
+	}
+
+	results, err := s.index.Search(vector, k)
+	if err != nil {
+		return err
+	}
+
+	if len(results) == 0 {
+		fmt.Fprintln(output, "no matches")
+		return nil
+	}
+
+	for idx, result := range results {
+		fmt.Fprintf(output, "%d. score=%.6f id=%s text=%q\n", idx+1, result.Score, result.ID, result.Text)
+	}
+	return nil
+}
+
+func (s *replSession) handleList(output io.Writer) {
+	records := s.index.List()
+	if len(records) == 0 {
+		fmt.Fprintln(output, "index is empty")
+		return
+	}
+
+	for idx, record := range records {
+		fmt.Fprintf(output, "%d. id=%s text=%q dims=%d\n", idx+1, record.ID, record.Text, len(record.Vector))
+	}
+}
+
+func (s *replSession) nextDocID() string {
+	s.nextID++
+	return fmt.Sprintf("doc-%d", s.nextID)
+}
+
+func printHelp(output io.Writer) {
+	fmt.Fprintln(output, "commands:")
+	fmt.Fprintln(output, "  insert <text>")
+	fmt.Fprintln(output, "  query <k> <text>")
+	fmt.Fprintln(output, "  list")
+	fmt.Fprintln(output, "  help")
+	fmt.Fprintln(output, "  exit | quit")
+	fmt.Fprintln(output, "vectors are stored in memory only for the current process")
 }
