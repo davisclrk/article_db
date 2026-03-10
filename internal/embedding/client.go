@@ -18,9 +18,9 @@ type Client struct {
 }
 
 type embedRequest struct {
-	Model          string `json:"model"`
-	Input          string `json:"input"`
-	EncodingFormat string `json:"encoding_format,omitempty"`
+	Model          string   `json:"model"`
+	Input          []string `json:"input"`
+	EncodingFormat string   `json:"encoding_format,omitempty"`
 }
 
 type embedResponse struct {
@@ -53,8 +53,16 @@ func NewClient(apiKey, model, baseURL string, httpClient *http.Client) *Client {
 }
 
 func (c *Client) Embed(ctx context.Context, input string) ([]float32, error) {
-	if input == "" {
-		return nil, fmt.Errorf("input cannot be empty")
+	vectors, err := c.EmbedBatch(ctx, []string{input})
+	if err != nil {
+		return nil, err
+	}
+	return vectors[0], nil
+}
+
+func (c *Client) EmbedBatch(ctx context.Context, inputs []string) ([][]float32, error) {
+	if len(inputs) == 0 {
+		return nil, fmt.Errorf("inputs cannot be empty")
 	}
 	if c.apiKey == "" {
 		return nil, fmt.Errorf("OPENROUTER_API_KEY is empty")
@@ -62,7 +70,7 @@ func (c *Client) Embed(ctx context.Context, input string) ([]float32, error) {
 
 	payload := embedRequest{
 		Model:          c.model,
-		Input:          input,
+		Input:          inputs,
 		EncodingFormat: "float",
 	}
 
@@ -101,9 +109,24 @@ func (c *Client) Embed(ctx context.Context, input string) ([]float32, error) {
 		return nil, fmt.Errorf("embedding API error (%d)", resp.StatusCode)
 	}
 
-	if len(parsed.Data) == 0 || len(parsed.Data[0].Embedding) == 0 {
-		return nil, fmt.Errorf("embedding API returned no vector")
+	if len(parsed.Data) == 0 {
+		return nil, fmt.Errorf("embedding API returned no vectors")
 	}
 
-	return parsed.Data[0].Embedding, nil
+	vectors := make([][]float32, len(inputs))
+	for i := range parsed.Data {
+		idx := parsed.Data[i].Index
+		if idx < 0 || idx >= len(inputs) {
+			return nil, fmt.Errorf("embedding API returned invalid index %d", idx)
+		}
+		vectors[idx] = parsed.Data[i].Embedding
+	}
+
+	for i := range vectors {
+		if len(vectors[i]) == 0 {
+			return nil, fmt.Errorf("missing embedding at index %d", i)
+		}
+	}
+
+	return vectors, nil
 }
