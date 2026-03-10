@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"article_db/internal/config"
-	"article_db/internal/embedding"
-	"article_db/internal/index"
+	"github.com/davisclrk/article_db/internal/config"
+	"github.com/davisclrk/article_db/internal/embedding"
+	"github.com/davisclrk/article_db/internal/index"
 )
 
 func main() {

@@ -6,7 +6,7 @@ build:
 	go build -o bin/shard ./cmd/shard
 
 run:
-	go run ./cmd/coordinator -shards=3 -data-dir=./data -addr=:8080
+	CGO_ENABLED=0 go run ./cmd/coordinator
 
 clean:
 	rm -rf bin/
