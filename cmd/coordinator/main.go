@@ -23,14 +23,14 @@ func main() {
 	}
 
 	client := embedding.NewClient(cfg.OpenRouterAPIKey, cfg.EmbeddingModel, cfg.OpenRouterBaseURL, nil)
-	localIndex := index.NewLocalIndex()
+	hnswIndex := index.NewHNSWIndex(index.DefaultHNSWConfig())
 
-	fmt.Printf("local vector index ready (model=%s)\n", cfg.EmbeddingModel)
+	fmt.Printf("HNSW vector index ready (model=%s, M=%d)\n", cfg.EmbeddingModel, index.DefaultHNSWConfig().M)
 	printHelp(os.Stdout)
 
 	session := replSession{
 		client: client,
-		index:  localIndex,
+		index:  hnswIndex,
 	}
 	if err := session.run(context.Background(), os.Stdin, os.Stdout); err != nil {
 		log.Fatalf("coordinator exited with error: %v", err)
@@ -39,7 +39,7 @@ func main() {
 
 type replSession struct {
 	client *embedding.Client
-	index  *index.LocalIndex
+	index  index.VectorIndex
 	nextID int
 }
 
