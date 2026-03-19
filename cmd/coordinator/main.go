@@ -10,9 +10,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/davisclrk/article_db/internal/article"
 	"github.com/davisclrk/article_db/internal/config"
 	"github.com/davisclrk/article_db/internal/embedding"
 	"github.com/davisclrk/article_db/internal/index"
+	"github.com/davisclrk/article_db/internal/models"
 )
 
 func main() {
@@ -23,14 +25,15 @@ func main() {
 	}
 
 	client := embedding.NewClient(cfg.OpenRouterAPIKey, cfg.EmbeddingModel, cfg.OpenRouterBaseURL, nil)
-	localIndex := index.NewLocalIndex()
+	hnswIndex := index.NewHNSWIndex(index.DefaultHNSWConfig())
 
-	fmt.Printf("local vector index ready (model=%s)\n", cfg.EmbeddingModel)
+	fmt.Printf("HNSW vector index ready (model=%s, M=%d)\n", cfg.EmbeddingModel, index.DefaultHNSWConfig().M)
 	printHelp(os.Stdout)
 
 	session := replSession{
-		client: client,
-		index:  localIndex,
+		client:   client,
+		index:    hnswIndex,
+		articles: make(map[string]*models.Article),
 	}
 	if err := session.run(context.Background(), os.Stdin, os.Stdout); err != nil {
 		log.Fatalf("coordinator exited with error: %v", err)
@@ -38,9 +41,10 @@ func main() {
 }
 
 type replSession struct {
-	client *embedding.Client
-	index  *index.LocalIndex
-	nextID int
+	client   *embedding.Client
+	index    index.VectorIndex
+	articles map[string]*models.Article
+	nextID   int
 }
 
 func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer) error {
@@ -85,22 +89,44 @@ func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer
 	}
 }
 
-func (s *replSession) handleInsert(ctx context.Context, text string, output io.Writer) error {
-	if text == "" {
-		return fmt.Errorf("usage: insert <text>")
+func (s *replSession) handleInsert(ctx context.Context, url string, output io.Writer) error {
+	if url == "" {
+		return fmt.Errorf("usage: insert <url>")
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return fmt.Errorf("invalid URL: must start with http:// or https://")
 	}
 
-	vector, err := s.client.Embed(ctx, text)
+	fmt.Fprintf(output, "fetching %s...\n", url)
+	headline, content, err := article.Fetch(ctx, url)
+	if err != nil {
+		return fmt.Errorf("article extraction failed: %w", err)
+	}
+
+	summary := article.Summarize(content, 3)
+	searchText := article.BuildSearchText(headline, summary)
+
+	fmt.Fprintf(output, "embedding %q...\n", headline)
+	vector, err := s.client.Embed(ctx, searchText)
 	if err != nil {
 		return fmt.Errorf("embedding request failed: %w", err)
 	}
 
 	id := s.nextDocID()
-	if err := s.index.Insert(id, text, vector); err != nil {
+	if err := s.index.Insert(id, searchText, vector); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(output, "stored %s dims=%d\n", id, len(vector))
+	s.articles[id] = &models.Article{
+		ID:       id,
+		URL:      url,
+		Headline: headline,
+		Summary:  summary,
+		Content:  content,
+		Vector:   vector,
+	}
+
+	fmt.Fprintf(output, "stored %s %q (dims=%d)\n", id, headline, len(vector))
 	return nil
 }
 
@@ -131,7 +157,11 @@ func (s *replSession) handleQuery(ctx context.Context, args string, output io.Wr
 	}
 
 	for idx, result := range results {
-		fmt.Fprintf(output, "%d. score=%.6f id=%s text=%q\n", idx+1, result.Score, result.ID, result.Text)
+		if a, ok := s.articles[result.ID]; ok {
+			fmt.Fprintf(output, "%d. score=%.6f id=%s headline=%q url=%s\n", idx+1, result.Score, result.ID, a.Headline, a.URL)
+		} else {
+			fmt.Fprintf(output, "%d. score=%.6f id=%s text=%q\n", idx+1, result.Score, result.ID, result.Text) // safety net
+		}
 	}
 	return nil
 }
@@ -144,7 +174,11 @@ func (s *replSession) handleList(output io.Writer) {
 	}
 
 	for idx, record := range records {
-		fmt.Fprintf(output, "%d. id=%s text=%q dims=%d\n", idx+1, record.ID, record.Text, len(record.Vector))
+		if a, ok := s.articles[record.ID]; ok {
+			fmt.Fprintf(output, "%d. id=%s headline=%q url=%s\n", idx+1, record.ID, a.Headline, a.URL)
+		} else {
+			fmt.Fprintf(output, "%d. id=%s text=%q dims=%d\n", idx+1, record.ID, record.Text, len(record.Vector))
+		}
 	}
 }
 
@@ -155,10 +189,9 @@ func (s *replSession) nextDocID() string {
 
 func printHelp(output io.Writer) {
 	fmt.Fprintln(output, "commands:")
-	fmt.Fprintln(output, "  insert <text>")
-	fmt.Fprintln(output, "  query <k> <text>")
-	fmt.Fprintln(output, "  list")
+	fmt.Fprintln(output, "  insert <url>       fetch article, summarize, embed, and store")
+	fmt.Fprintln(output, "  query <k> <text>   semantic search for top-k similar articles")
+	fmt.Fprintln(output, "  list               show all stored articles")
 	fmt.Fprintln(output, "  help")
 	fmt.Fprintln(output, "  exit | quit")
-	fmt.Fprintln(output, "vectors are stored in memory only for the current process")
 }
