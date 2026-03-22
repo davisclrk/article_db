@@ -19,6 +19,7 @@ type SearchResult struct {
 
 type VectorIndex interface {
 	Insert(id, text string, vector []float32) error
+	Delete(id string) error
 	Search(query []float32, k int) ([]SearchResult, error)
 	List() []Record
 }

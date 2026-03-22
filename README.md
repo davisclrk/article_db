@@ -18,7 +18,7 @@ High-level query flow:
 1. User submits a text query of articles they are interested in
 2. Query text is embedded and broadcasted to shard primaries
 3. Shards return top-k candidate matches
-4. the coordinator merges and returns global top-k results, deduplicating the results (if any duplicates exist)
+4. The coordinator merges and returns global top-k results, deduplicating the results (if any duplicates exist)
 
 ---
 

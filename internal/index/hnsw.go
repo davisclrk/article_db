@@ -39,6 +39,7 @@ type HNSWIndex struct {
 	entryPoint int
 
 	nodes []hnswNode
+	idMap map[string]int
 	rng   *rand.Rand
 }
 
@@ -47,6 +48,7 @@ type hnswNode struct {
 	norm        float64
 	connections [][]int
 	level       int
+	deleted     bool
 }
 
 func NewHNSWIndex(cfg HNSWConfig) *HNSWIndex {
@@ -73,6 +75,7 @@ func NewHNSWIndex(cfg HNSWConfig) *HNSWIndex {
 		ml:         1.0 / math.Log(float64(cfg.M)),
 		maxLevel:   -1,
 		entryPoint: -1,
+		idMap:      make(map[string]int),
 		rng:        rand.New(rand.NewSource(seed)),
 	}
 }
@@ -116,6 +119,7 @@ func (h *HNSWIndex) Insert(id, text string, vector []float32) error {
 	}
 	nodeIdx := len(h.nodes)
 	h.nodes = append(h.nodes, node)
+	h.idMap[id] = nodeIdx
 
 	if h.entryPoint == -1 {
 		h.entryPoint = nodeIdx
@@ -173,6 +177,19 @@ func (h *HNSWIndex) Insert(id, text string, vector []float32) error {
 	return nil
 }
 
+func (h *HNSWIndex) Delete(id string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	nodeIdx, ok := h.idMap[id]
+	if !ok {
+		return fmt.Errorf("id %q not found", id)
+	}
+	h.nodes[nodeIdx].deleted = true
+	delete(h.idMap, id)
+	return nil
+}
+
 func (h *HNSWIndex) Search(query []float32, k int) ([]SearchResult, error) {
 	if k <= 0 {
 		return []SearchResult{}, nil
@@ -204,16 +221,18 @@ func (h *HNSWIndex) Search(query []float32, k int) ([]SearchResult, error) {
 	}
 	candidates := h.searchLayer(query, queryNorm, ep, ef, 0)
 
-	if len(candidates) > k {
-		candidates = candidates[:k]
-	}
-
-	results := make([]SearchResult, len(candidates))
-	for i, c := range candidates {
-		results[i] = SearchResult{
+	results := make([]SearchResult, 0, k)
+	for _, c := range candidates {
+		if h.nodes[c.id].deleted {
+			continue
+		}
+		results = append(results, SearchResult{
 			ID:    h.nodes[c.id].record.ID,
 			Text:  h.nodes[c.id].record.Text,
 			Score: c.similarity,
+		})
+		if len(results) == k {
+			break
 		}
 	}
 	return results, nil
@@ -223,13 +242,16 @@ func (h *HNSWIndex) List() []Record {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	records := make([]Record, len(h.nodes))
-	for i, node := range h.nodes {
-		records[i] = Record{
+	records := make([]Record, 0, len(h.nodes))
+	for _, node := range h.nodes {
+		if node.deleted {
+			continue
+		}
+		records = append(records, Record{
 			ID:     node.record.ID,
 			Text:   node.record.Text,
 			Vector: append([]float32(nil), node.record.Vector...),
-		}
+		})
 	}
 	return records
 }

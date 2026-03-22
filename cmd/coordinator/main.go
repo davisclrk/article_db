@@ -72,6 +72,14 @@ func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer
 			if err := s.handleInsert(ctx, strings.TrimSpace(rest), output); err != nil {
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
+		case "get":
+			if err := s.handleGet(strings.TrimSpace(rest), output); err != nil {
+				fmt.Fprintf(output, "error: %v\n", err)
+			}
+		case "delete":
+			if err := s.handleDelete(strings.TrimSpace(rest), output); err != nil {
+				fmt.Fprintf(output, "error: %v\n", err)
+			}
 		case "query":
 			if err := s.handleQuery(ctx, strings.TrimSpace(rest), output); err != nil {
 				fmt.Fprintf(output, "error: %v\n", err)
@@ -80,7 +88,7 @@ func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer
 			s.handleList(output)
 		case "help":
 			printHelp(output)
-		case "exit", "quit":
+		case "quit":
 			return nil
 		default:
 			fmt.Fprintf(output, "error: unknown command %q\n", command)
@@ -127,6 +135,36 @@ func (s *replSession) handleInsert(ctx context.Context, url string, output io.Wr
 	}
 
 	fmt.Fprintf(output, "stored %s %q (dims=%d)\n", id, headline, len(vector))
+	return nil
+}
+
+func (s *replSession) handleGet(id string, output io.Writer) error {
+	if id == "" {
+		return fmt.Errorf("usage: get <id>")
+	}
+	a, ok := s.articles[id]
+	if !ok {
+		return fmt.Errorf("article %q not found", id)
+	}
+	fmt.Fprintf(output, "id:       %s\n", a.ID)
+	fmt.Fprintf(output, "url:      %s\n", a.URL)
+	fmt.Fprintf(output, "headline: %s\n", a.Headline)
+	fmt.Fprintf(output, "summary:  %s\n", a.Summary)
+	return nil
+}
+
+func (s *replSession) handleDelete(id string, output io.Writer) error {
+	if id == "" {
+		return fmt.Errorf("usage: delete <id>")
+	}
+	if _, ok := s.articles[id]; !ok {
+		return fmt.Errorf("article %q not found", id)
+	}
+	if err := s.index.Delete(id); err != nil {
+		return err
+	}
+	delete(s.articles, id)
+	fmt.Fprintf(output, "deleted %s\n", id)
 	return nil
 }
 
@@ -190,8 +228,10 @@ func (s *replSession) nextDocID() string {
 func printHelp(output io.Writer) {
 	fmt.Fprintln(output, "commands:")
 	fmt.Fprintln(output, "  insert <url>       fetch article, summarize, embed, and store")
+	fmt.Fprintln(output, "  get <id>           show article details by ID")
+	fmt.Fprintln(output, "  delete <id>        remove article by ID")
 	fmt.Fprintln(output, "  query <k> <text>   semantic search for top-k similar articles")
 	fmt.Fprintln(output, "  list               show all stored articles")
 	fmt.Fprintln(output, "  help")
-	fmt.Fprintln(output, "  exit | quit")
+	fmt.Fprintln(output, "  quit")
 }
