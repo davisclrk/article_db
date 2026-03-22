@@ -10,7 +10,7 @@ The database ingests articles, extracts main text and generates a short summary,
 
 High-level ingestion flow:
 1. User submits a URL of a news article
-2. Server extracts article text, headline, and creates a short summary (initially implemented as the first N sentences of the article)
+2. Server extracts article text, headline, and creates a short summary (initially implemented as the first N sentences of the article, currently N = 3)
 3. Server constructs `search_text` string and embeds it into a vector utilzing the OpenAI embedding API
 4. Vector + metadata are stored on a shard node (with an exact copy on a replica node, the write will be acknowledged after the primary confirms the write)
 
@@ -18,7 +18,7 @@ High-level query flow:
 1. User submits a text query of articles they are interested in
 2. Query text is embedded and broadcasted to shard primaries
 3. Shards return top-k candidate matches
-4. the coordinator merges and returns global top-k results, deduplicating the results (if any duplicates exist)
+4. The coordinator merges and returns global top-k results, deduplicating the results (if any duplicates exist)
 
 ---
 
