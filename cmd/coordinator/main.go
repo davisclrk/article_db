@@ -12,6 +12,7 @@ import (
 
 	"github.com/davisclrk/article_db/internal/article"
 	"github.com/davisclrk/article_db/internal/config"
+	"github.com/davisclrk/article_db/internal/coordinator"
 	"github.com/davisclrk/article_db/internal/embedding"
 	"github.com/davisclrk/article_db/internal/index"
 	"github.com/davisclrk/article_db/internal/models"
@@ -25,26 +26,65 @@ func main() {
 	}
 
 	client := embedding.NewClient(cfg.OpenRouterAPIKey, cfg.EmbeddingModel, cfg.OpenRouterBaseURL, nil)
-	hnswIndex := index.NewHNSWIndex(index.DefaultHNSWConfig())
+	vecIndex := newVectorIndexFromEnv()
 
-	fmt.Printf("HNSW vector index ready (model=%s, M=%d)\n", cfg.EmbeddingModel, index.DefaultHNSWConfig().M)
+	numShards := 3
+	if v := os.Getenv("ARTICLE_DB_NUM_SHARDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			numShards = n
+		}
+	}
+	dataDir := os.Getenv("ARTICLE_DB_DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	coord, err := coordinator.NewCoordinator(coordinator.Config{
+		NumShards: numShards,
+		DataDir:   dataDir,
+	})
+	if err != nil {
+		log.Fatalf("coordinator: %v", err)
+	}
+	defer coord.Close()
+
+	printIndexBanner(vecIndex, cfg.EmbeddingModel)
 	printHelp(os.Stdout)
 
 	session := replSession{
-		client:   client,
-		index:    hnswIndex,
-		articles: make(map[string]*models.Article),
+		client:      client,
+		index:       vecIndex,
+		coordinator: coord,
 	}
 	if err := session.run(context.Background(), os.Stdin, os.Stdout); err != nil {
 		log.Fatalf("coordinator exited with error: %v", err)
 	}
 }
 
+func newVectorIndexFromEnv() index.VectorIndex {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ARTICLE_DB_INDEX")), "brute") {
+		return index.NewBruteForceIndex()
+	}
+	return index.NewHNSWIndex(index.DefaultHNSWConfig())
+}
+
+func printIndexBanner(vecIndex index.VectorIndex, model string) {
+	switch vecIndex.(type) {
+	case *index.BruteForceIndex:
+		fmt.Printf("In-memory index: brute-force (model=%s)\n", model)
+	case *index.HNSWIndex:
+		hcfg := index.DefaultHNSWConfig()
+		fmt.Printf("In-memory index: HNSW (M=%d, efConstruction=%d, efSearch=%d, model=%s)\n",
+			hcfg.M, hcfg.EfConstruction, hcfg.EfSearch, model)
+	default:
+		fmt.Printf("In-memory index: %T (model=%s)\n", vecIndex, model)
+	}
+	fmt.Println("Query path: in-memory index (HNSW default, brute-force optional).")
+}
+
 type replSession struct {
-	client   *embedding.Client
-	index    index.VectorIndex
-	articles map[string]*models.Article
-	nextID   int
+	client      *embedding.Client
+	index       index.VectorIndex
+	coordinator *coordinator.Coordinator
 }
 
 func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer) error {
@@ -120,21 +160,23 @@ func (s *replSession) handleInsert(ctx context.Context, url string, output io.Wr
 		return fmt.Errorf("embedding request failed: %w", err)
 	}
 
-	id := s.nextDocID()
-	if err := s.index.Insert(id, searchText, vector); err != nil {
-		return err
-	}
-
-	s.articles[id] = &models.Article{
-		ID:       id,
+	a := &models.Article{
 		URL:      url,
 		Headline: headline,
 		Summary:  summary,
 		Content:  content,
 		Vector:   vector,
 	}
+	id, err := s.coordinator.Insert(a)
+	if err != nil {
+		return err
+	}
+	if err := s.index.Insert(id, searchText, vector); err != nil {
+		_ = s.coordinator.Delete(id)
+		return err
+	}
 
-	fmt.Fprintf(output, "stored %s %q (dims=%d)\n", id, headline, len(vector))
+	fmt.Fprintf(output, "stored %s %q (dims=%d) shard=%d\n", id, headline, len(vector), a.ShardID)
 	return nil
 }
 
@@ -142,9 +184,9 @@ func (s *replSession) handleGet(id string, output io.Writer) error {
 	if id == "" {
 		return fmt.Errorf("usage: get <id>")
 	}
-	a, ok := s.articles[id]
-	if !ok {
-		return fmt.Errorf("article %q not found", id)
+	a, err := s.coordinator.Get(id)
+	if err != nil {
+		return err
 	}
 	fmt.Fprintf(output, "id:       %s\n", a.ID)
 	fmt.Fprintf(output, "url:      %s\n", a.URL)
@@ -157,13 +199,12 @@ func (s *replSession) handleDelete(id string, output io.Writer) error {
 	if id == "" {
 		return fmt.Errorf("usage: delete <id>")
 	}
-	if _, ok := s.articles[id]; !ok {
-		return fmt.Errorf("article %q not found", id)
+	if err := s.coordinator.Delete(id); err != nil {
+		return err
 	}
 	if err := s.index.Delete(id); err != nil {
 		return err
 	}
-	delete(s.articles, id)
 	fmt.Fprintf(output, "deleted %s\n", id)
 	return nil
 }
@@ -194,12 +235,15 @@ func (s *replSession) handleQuery(ctx context.Context, args string, output io.Wr
 		return nil
 	}
 
-	for idx, result := range results {
-		if a, ok := s.articles[result.ID]; ok {
-			fmt.Fprintf(output, "%d. score=%.6f id=%s headline=%q url=%s\n", idx+1, result.Score, result.ID, a.Headline, a.URL)
-		} else {
-			fmt.Fprintf(output, "%d. score=%.6f id=%s text=%q\n", idx+1, result.Score, result.ID, result.Text) // safety net
+	for idx, r := range results {
+		a, err := s.coordinator.Get(r.ID)
+		if err == nil && a != nil {
+			fmt.Fprintf(output, "%d. score=%.6f id=%s headline=%q url=%s\n",
+				idx+1, r.Score, a.ID, a.Headline, a.URL)
+			continue
 		}
+		fmt.Fprintf(output, "%d. score=%.6f id=%s text=%q\n",
+			idx+1, r.Score, r.ID, r.Text)
 	}
 	return nil
 }
@@ -212,17 +256,13 @@ func (s *replSession) handleList(output io.Writer) {
 	}
 
 	for idx, record := range records {
-		if a, ok := s.articles[record.ID]; ok {
-			fmt.Fprintf(output, "%d. id=%s headline=%q url=%s\n", idx+1, record.ID, a.Headline, a.URL)
+		a, err := s.coordinator.Get(record.ID)
+		if err == nil && a != nil {
+			fmt.Fprintf(output, "%d. id=%s shard=%d headline=%q url=%s\n", idx+1, record.ID, a.ShardID, a.Headline, a.URL)
 		} else {
 			fmt.Fprintf(output, "%d. id=%s text=%q dims=%d\n", idx+1, record.ID, record.Text, len(record.Vector))
 		}
 	}
-}
-
-func (s *replSession) nextDocID() string {
-	s.nextID++
-	return fmt.Sprintf("doc-%d", s.nextID)
 }
 
 func printHelp(output io.Writer) {
@@ -231,7 +271,8 @@ func printHelp(output io.Writer) {
 	fmt.Fprintln(output, "  get <id>           show article details by ID")
 	fmt.Fprintln(output, "  delete <id>        remove article by ID")
 	fmt.Fprintln(output, "  query <k> <text>   semantic search for top-k similar articles")
-	fmt.Fprintln(output, "  list               show all stored articles")
+	fmt.Fprintln(output, "  list               show in-memory index entries (see env below)")
 	fmt.Fprintln(output, "  help")
 	fmt.Fprintln(output, "  quit")
+	fmt.Fprintln(output, "env: ARTICLE_DB_INDEX=brute|hnsw  ARTICLE_DB_NUM_SHARDS  ARTICLE_DB_DATA_DIR")
 }

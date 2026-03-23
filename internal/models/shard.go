@@ -27,8 +27,15 @@ func NewShardMap(numShards int) *ShardMap {
 }
 
 func (sm *ShardMap) GetShardForID(docID string) int {
+	if sm.NumShards <= 0 {
+		return 0
+	}
 	hash := hashString(docID)
-	return hash % sm.NumShards
+	shard := hash % sm.NumShards
+	if shard < 0 {
+		shard += sm.NumShards
+	}
+	return shard
 }
 
 func hashString(s string) int {
