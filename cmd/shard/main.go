@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/davisclrk/article_db/internal/index"
 	"github.com/davisclrk/article_db/internal/shard"
 )
 
@@ -22,7 +24,12 @@ func main() {
 		*dbPath = fmt.Sprintf("./data/shard_%d.db", *shardID)
 	}
 
-	node, err := shard.NewNode(*shardID, *isPrimary, *dbPath)
+	node, err := shard.NewNode(shard.Config{
+		ShardID:   *shardID,
+		IsPrimary: *isPrimary,
+		DBPath:    *dbPath,
+		NewIndex:  newVectorIndexFromEnv,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create shard node: %v\n", err)
 		os.Exit(1)
@@ -42,4 +49,11 @@ func main() {
 	// 		 For now, this is a placeholder for when we separate shard nodes
 	<-sigChan
 	fmt.Println("\nShutting down shard node...")
+}
+
+func newVectorIndexFromEnv() index.VectorIndex {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ARTICLE_DB_INDEX")), "brute") {
+		return index.NewBruteForceIndex()
+	}
+	return index.NewHNSWIndex(index.DefaultHNSWConfig())
 }

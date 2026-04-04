@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/davisclrk/article_db/internal/index"
 	"github.com/davisclrk/article_db/internal/models"
 	"github.com/davisclrk/article_db/internal/shard"
 )
@@ -22,6 +23,7 @@ type Coordinator struct {
 type Config struct {
 	NumShards int
 	DataDir   string
+	NewIndex  func() index.VectorIndex
 }
 
 func NewCoordinator(cfg Config) (*Coordinator, error) {
@@ -39,7 +41,12 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 
 	for i := 0; i < cfg.NumShards; i++ {
 		dbPath := fmt.Sprintf("%s/shard_%d.db", cfg.DataDir, i)
-		node, err := shard.NewNode(i, true, dbPath)
+		node, err := shard.NewNode(shard.Config{
+			ShardID:   i,
+			IsPrimary: true,
+			DBPath:    dbPath,
+			NewIndex:  cfg.NewIndex,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
 		}
@@ -126,7 +133,7 @@ func (c *Coordinator) Delete(id string) error {
 	return node.DeleteArticle(id)
 }
 
-// Query asks each shard for its local top-k by cosine similarity (brute force), then merges
+// Query asks each shard for its local top-k from its shard-local vector index, then merges
 // and deduplicates by article ID before returning the global top-k.
 func (c *Coordinator) Query(queryVector []float32, k int) ([]models.SearchResult, error) {
 	if k <= 0 {
@@ -171,6 +178,33 @@ func (c *Coordinator) Query(queryVector []float32, k int) ([]models.SearchResult
 	}
 
 	return mergeSearchResults(partials, k), nil
+}
+
+func (c *Coordinator) ListArticles() ([]*models.Article, error) {
+	c.mu.RLock()
+	numShards := c.shardMap.NumShards
+	nodes := make([]*shard.Node, numShards)
+	for i := 0; i < numShards; i++ {
+		nodes[i] = c.shardNodes[i]
+	}
+	c.mu.RUnlock()
+
+	articles := make([]*models.Article, 0)
+	for _, node := range nodes {
+		shardArticles, err := node.ListArticles()
+		if err != nil {
+			return nil, err
+		}
+		articles = append(articles, shardArticles...)
+	}
+
+	sort.SliceStable(articles, func(i, j int) bool {
+		if articles[i].ShardID == articles[j].ShardID {
+			return articles[i].ID < articles[j].ID
+		}
+		return articles[i].ShardID < articles[j].ShardID
+	})
+	return articles, nil
 }
 
 func mergeSearchResults(partials [][]models.SearchResult, k int) []models.SearchResult {

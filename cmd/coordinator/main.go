@@ -26,7 +26,6 @@ func main() {
 	}
 
 	client := embedding.NewClient(cfg.OpenRouterAPIKey, cfg.EmbeddingModel, cfg.OpenRouterBaseURL, nil)
-	vecIndex := newVectorIndexFromEnv()
 
 	numShards := 3
 	if v := os.Getenv("ARTICLE_DB_NUM_SHARDS"); v != "" {
@@ -41,18 +40,18 @@ func main() {
 	coord, err := coordinator.NewCoordinator(coordinator.Config{
 		NumShards: numShards,
 		DataDir:   dataDir,
+		NewIndex:  newVectorIndexFromEnv,
 	})
 	if err != nil {
 		log.Fatalf("coordinator: %v", err)
 	}
 	defer coord.Close()
 
-	printIndexBanner(vecIndex, cfg.EmbeddingModel)
+	printIndexBanner(cfg.EmbeddingModel)
 	printHelp(os.Stdout)
 
 	session := replSession{
 		client:      client,
-		index:       vecIndex,
 		coordinator: coord,
 	}
 	if err := session.run(context.Background(), os.Stdin, os.Stdout); err != nil {
@@ -67,23 +66,21 @@ func newVectorIndexFromEnv() index.VectorIndex {
 	return index.NewHNSWIndex(index.DefaultHNSWConfig())
 }
 
-func printIndexBanner(vecIndex index.VectorIndex, model string) {
-	switch vecIndex.(type) {
-	case *index.BruteForceIndex:
-		fmt.Printf("In-memory index: brute-force (model=%s)\n", model)
-	case *index.HNSWIndex:
-		hcfg := index.DefaultHNSWConfig()
-		fmt.Printf("In-memory index: HNSW (M=%d, efConstruction=%d, efSearch=%d, model=%s)\n",
-			hcfg.M, hcfg.EfConstruction, hcfg.EfSearch, model)
-	default:
-		fmt.Printf("In-memory index: %T (model=%s)\n", vecIndex, model)
+func printIndexBanner(model string) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ARTICLE_DB_INDEX")), "brute") {
+		fmt.Printf("Shard-local index: brute-force (model=%s)\n", model)
+		fmt.Println("Query path: coordinator fanout to shard-local indexes (HNSW default, brute-force optional).")
+		return
 	}
-	fmt.Println("Query path: in-memory index (HNSW default, brute-force optional).")
+
+	hcfg := index.DefaultHNSWConfig()
+	fmt.Printf("Shard-local index: HNSW (M=%d, efConstruction=%d, efSearch=%d, model=%s)\n",
+		hcfg.M, hcfg.EfConstruction, hcfg.EfSearch, model)
+	fmt.Println("Query path: coordinator fanout to shard-local indexes (HNSW default, brute-force optional).")
 }
 
 type replSession struct {
 	client      *embedding.Client
-	index       index.VectorIndex
 	coordinator *coordinator.Coordinator
 }
 
@@ -125,7 +122,9 @@ func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
 		case "list":
-			s.handleList(output)
+			if err := s.handleList(output); err != nil {
+				fmt.Fprintf(output, "error: %v\n", err)
+			}
 		case "help":
 			printHelp(output)
 		case "quit":
@@ -171,10 +170,6 @@ func (s *replSession) handleInsert(ctx context.Context, url string, output io.Wr
 	if err != nil {
 		return err
 	}
-	if err := s.index.Insert(id, searchText, vector); err != nil {
-		_ = s.coordinator.Delete(id)
-		return err
-	}
 
 	fmt.Fprintf(output, "stored %s %q (dims=%d) shard=%d\n", id, headline, len(vector), a.ShardID)
 	return nil
@@ -202,9 +197,6 @@ func (s *replSession) handleDelete(id string, output io.Writer) error {
 	if err := s.coordinator.Delete(id); err != nil {
 		return err
 	}
-	if err := s.index.Delete(id); err != nil {
-		return err
-	}
 	fmt.Fprintf(output, "deleted %s\n", id)
 	return nil
 }
@@ -225,7 +217,7 @@ func (s *replSession) handleQuery(ctx context.Context, args string, output io.Wr
 		return fmt.Errorf("embedding request failed: %w", err)
 	}
 
-	results, err := s.index.Search(vector, k)
+	results, err := s.coordinator.Query(vector, k)
 	if err != nil {
 		return err
 	}
@@ -236,33 +228,26 @@ func (s *replSession) handleQuery(ctx context.Context, args string, output io.Wr
 	}
 
 	for idx, r := range results {
-		a, err := s.coordinator.Get(r.ID)
-		if err == nil && a != nil {
-			fmt.Fprintf(output, "%d. score=%.6f id=%s headline=%q url=%s\n",
-				idx+1, r.Score, a.ID, a.Headline, a.URL)
-			continue
-		}
-		fmt.Fprintf(output, "%d. score=%.6f id=%s text=%q\n",
-			idx+1, r.Score, r.ID, r.Text)
+		fmt.Fprintf(output, "%d. score=%.6f id=%s headline=%q url=%s\n",
+			idx+1, r.Score, r.Article.ID, r.Article.Headline, r.Article.URL)
 	}
 	return nil
 }
 
-func (s *replSession) handleList(output io.Writer) {
-	records := s.index.List()
-	if len(records) == 0 {
-		fmt.Fprintln(output, "index is empty")
-		return
+func (s *replSession) handleList(output io.Writer) error {
+	articles, err := s.coordinator.ListArticles()
+	if err != nil {
+		return err
+	}
+	if len(articles) == 0 {
+		fmt.Fprintln(output, "no stored articles")
+		return nil
 	}
 
-	for idx, record := range records {
-		a, err := s.coordinator.Get(record.ID)
-		if err == nil && a != nil {
-			fmt.Fprintf(output, "%d. id=%s shard=%d headline=%q url=%s\n", idx+1, record.ID, a.ShardID, a.Headline, a.URL)
-		} else {
-			fmt.Fprintf(output, "%d. id=%s text=%q dims=%d\n", idx+1, record.ID, record.Text, len(record.Vector))
-		}
+	for idx, a := range articles {
+		fmt.Fprintf(output, "%d. id=%s shard=%d headline=%q url=%s\n", idx+1, a.ID, a.ShardID, a.Headline, a.URL)
 	}
+	return nil
 }
 
 func printHelp(output io.Writer) {
@@ -271,7 +256,7 @@ func printHelp(output io.Writer) {
 	fmt.Fprintln(output, "  get <id>           show article details by ID")
 	fmt.Fprintln(output, "  delete <id>        remove article by ID")
 	fmt.Fprintln(output, "  query <k> <text>   semantic search for top-k similar articles")
-	fmt.Fprintln(output, "  list               show in-memory index entries (see env below)")
+	fmt.Fprintln(output, "  list               show stored articles across shards")
 	fmt.Fprintln(output, "  help")
 	fmt.Fprintln(output, "  quit")
 	fmt.Fprintln(output, "env: ARTICLE_DB_INDEX=brute|hnsw  ARTICLE_DB_NUM_SHARDS  ARTICLE_DB_DATA_DIR")
