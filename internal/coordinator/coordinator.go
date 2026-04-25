@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -14,51 +15,57 @@ import (
 )
 
 type Coordinator struct {
-	shardMap   *models.ShardMap
-	shardNodes map[int]*shard.Node
-	mu         sync.RWMutex
-	nextDocID  uint64
+	shardMap     *models.ShardMap
+	shardClients map[int]Client
+	mu           sync.RWMutex
+	nextDocID    uint64
 }
 
 type Config struct {
 	NumShards int
 	DataDir   string
 	NewIndex  func() index.VectorIndex
+	Clients map[int]Client
 }
 
 func NewCoordinator(cfg Config) (*Coordinator, error) {
 	if cfg.NumShards <= 0 {
 		return nil, fmt.Errorf("num_shards must be positive")
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("data dir: %w", err)
-	}
 
-	c := &Coordinator{
-		shardMap:   models.NewShardMap(cfg.NumShards),
-		shardNodes: make(map[int]*shard.Node),
-	}
-
-	for i := 0; i < cfg.NumShards; i++ {
-		dbPath := fmt.Sprintf("%s/shard_%d.db", cfg.DataDir, i)
-		node, err := shard.NewNode(shard.Config{
-			ShardID:   i,
-			IsPrimary: true,
-			DBPath:    dbPath,
-			NewIndex:  cfg.NewIndex,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
+	clients := cfg.Clients
+	if clients == nil {
+		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+			return nil, fmt.Errorf("data dir: %w", err)
 		}
-		c.shardNodes[i] = node
+		clients = make(map[int]Client, cfg.NumShards)
+		for i := 0; i < cfg.NumShards; i++ {
+			dbPath := fmt.Sprintf("%s/shard_%d.db", cfg.DataDir, i)
+			node, err := shard.NewNode(shard.Config{
+				ShardID:   i,
+				IsPrimary: true,
+				DBPath:    dbPath,
+				NewIndex:  cfg.NewIndex,
+			})
+			if err != nil {
+				closeAll(clients)
+				return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
+			}
+			clients[i] = NewLocalClient(node)
+		}
+	} else if len(clients) != cfg.NumShards {
+		return nil, fmt.Errorf("clients map has %d entries, expected %d", len(clients), cfg.NumShards)
 	}
 
-	return c, nil
+	return &Coordinator{
+		shardMap:     models.NewShardMap(cfg.NumShards),
+		shardClients: clients,
+	}, nil
 }
 
 // Insert persists the article on the shard selected by hash(id) % num_shards.
 // If article.ID is empty, a new doc ID is assigned. Returns the stored ID.
-func (c *Coordinator) Insert(article *models.Article) (string, error) {
+func (c *Coordinator) Insert(ctx context.Context, article *models.Article) (string, error) {
 	if article == nil {
 		return "", fmt.Errorf("article is nil")
 	}
@@ -75,67 +82,57 @@ func (c *Coordinator) Insert(article *models.Article) (string, error) {
 		article.CreatedAt = time.Now().UTC()
 	}
 
-	c.mu.RLock()
-	node, ok := c.shardNodes[shardID]
-	c.mu.RUnlock()
-	if !ok {
-		return "", fmt.Errorf("unknown shard %d", shardID)
+	client, err := c.clientFor(shardID)
+	if err != nil {
+		return "", err
 	}
-	if err := node.InsertArticle(article); err != nil {
+	if err := client.InsertArticle(ctx, article); err != nil {
 		return "", err
 	}
 	return id, nil
 }
 
 // Get loads the article from the shard that owns the ID.
-func (c *Coordinator) Get(id string) (*models.Article, error) {
+func (c *Coordinator) Get(ctx context.Context, id string) (*models.Article, error) {
 	if id == "" {
 		return nil, fmt.Errorf("id is empty")
 	}
-	shardID := c.shardMap.GetShardForID(id)
-
-	c.mu.RLock()
-	node, ok := c.shardNodes[shardID]
-	c.mu.RUnlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown shard %d", shardID)
+	client, err := c.clientFor(c.shardMap.GetShardForID(id))
+	if err != nil {
+		return nil, err
 	}
-	a, err := node.GetArticle(id)
+	a, err := client.GetArticle(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if a == nil {
-		return nil, fmt.Errorf("article %q not found", id)
+		return nil, ErrNotFound
 	}
 	return a, nil
 }
 
 // Delete removes the article from the owning shard.
-func (c *Coordinator) Delete(id string) error {
+func (c *Coordinator) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("id is empty")
 	}
-	shardID := c.shardMap.GetShardForID(id)
-
-	c.mu.RLock()
-	node, ok := c.shardNodes[shardID]
-	c.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("unknown shard %d", shardID)
+	client, err := c.clientFor(c.shardMap.GetShardForID(id))
+	if err != nil {
+		return err
 	}
-	existing, err := node.GetArticle(id)
+	existing, err := client.GetArticle(ctx, id)
 	if err != nil {
 		return err
 	}
 	if existing == nil {
-		return fmt.Errorf("article %q not found", id)
+		return ErrNotFound
 	}
-	return node.DeleteArticle(id)
+	return client.DeleteArticle(ctx, id)
 }
 
 // Query asks each shard for its local top-k from its shard-local vector index, then merges
 // and deduplicates by article ID before returning the global top-k.
-func (c *Coordinator) Query(queryVector []float32, k int) ([]models.SearchResult, error) {
+func (c *Coordinator) Query(ctx context.Context, queryVector []float32, k int) ([]models.SearchResult, error) {
 	if k <= 0 {
 		return nil, fmt.Errorf("k must be positive")
 	}
@@ -145,9 +142,9 @@ func (c *Coordinator) Query(queryVector []float32, k int) ([]models.SearchResult
 
 	c.mu.RLock()
 	numShards := c.shardMap.NumShards
-	nodes := make([]*shard.Node, numShards)
+	clients := make([]Client, numShards)
 	for i := 0; i < numShards; i++ {
-		nodes[i] = c.shardNodes[i]
+		clients[i] = c.shardClients[i]
 	}
 	c.mu.RUnlock()
 
@@ -160,7 +157,7 @@ func (c *Coordinator) Query(queryVector []float32, k int) ([]models.SearchResult
 		wg.Add(1)
 		go func(shardID int) {
 			defer wg.Done()
-			local, err := nodes[shardID].SearchSimilar(queryVector, k)
+			local, err := clients[shardID].SearchSimilar(ctx, queryVector, k)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -180,18 +177,18 @@ func (c *Coordinator) Query(queryVector []float32, k int) ([]models.SearchResult
 	return mergeSearchResults(partials, k), nil
 }
 
-func (c *Coordinator) ListArticles() ([]*models.Article, error) {
+func (c *Coordinator) ListArticles(ctx context.Context) ([]*models.Article, error) {
 	c.mu.RLock()
 	numShards := c.shardMap.NumShards
-	nodes := make([]*shard.Node, numShards)
+	clients := make([]Client, numShards)
 	for i := 0; i < numShards; i++ {
-		nodes[i] = c.shardNodes[i]
+		clients[i] = c.shardClients[i]
 	}
 	c.mu.RUnlock()
 
 	articles := make([]*models.Article, 0)
-	for _, node := range nodes {
-		shardArticles, err := node.ListArticles()
+	for _, client := range clients {
+		shardArticles, err := client.ListArticles(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -205,6 +202,16 @@ func (c *Coordinator) ListArticles() ([]*models.Article, error) {
 		return articles[i].ShardID < articles[j].ShardID
 	})
 	return articles, nil
+}
+
+func (c *Coordinator) clientFor(shardID int) (Client, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	client, ok := c.shardClients[shardID]
+	if !ok {
+		return nil, fmt.Errorf("unknown shard %d", shardID)
+	}
+	return client, nil
 }
 
 func mergeSearchResults(partials [][]models.SearchResult, k int) []models.SearchResult {
@@ -236,11 +243,15 @@ func mergeSearchResults(partials [][]models.SearchResult, k int) []models.Search
 func (c *Coordinator) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return closeAll(c.shardClients)
+}
 
-	for _, node := range c.shardNodes {
-		if err := node.Close(); err != nil {
-			return err
+func closeAll(clients map[int]Client) error {
+	var firstErr error
+	for _, client := range clients {
+		if err := client.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return nil
+	return firstErr
 }

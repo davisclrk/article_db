@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/davisclrk/article_db/internal/index"
 	"github.com/davisclrk/article_db/internal/shard"
+	"github.com/davisclrk/article_db/internal/shardpb"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -40,15 +43,35 @@ func main() {
 		node.SetReplicaAddr(*replicaAddr)
 	}
 
+	lis, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to listen on %s: %v\n", *addr, err)
+		os.Exit(1)
+	}
+
+	grpcServer := grpc.NewServer()
+	shardpb.RegisterShardServiceServer(grpcServer, shardpb.NewServer(node))
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- grpcServer.Serve(lis)
+	}()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Printf("Shard %d starting on %s (primary=%v)\n", *shardID, *addr, *isPrimary)
+	fmt.Printf("Shard %d listening on %s (primary=%v)\n", *shardID, *addr, *isPrimary)
 
-	// TODO: Start gRPC server for distributed deployment
-	// 		 For now, this is a placeholder for when we separate shard nodes
-	<-sigChan
-	fmt.Println("\nShutting down shard node...")
+	select {
+	case <-sigChan:
+		fmt.Println("\nShutting down shard node...")
+		grpcServer.GracefulStop()
+	case err := <-serveErr:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gRPC server failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }
 
 func newVectorIndexFromEnv() index.VectorIndex {

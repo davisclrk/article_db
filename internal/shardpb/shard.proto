@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package articledb.shard.v1;
+
+option go_package = "github.com/davisclrk/article_db/internal/shardpb;shardpb";
+
+import "google/protobuf/timestamp.proto";
+
+service ShardService {
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc SearchSimilar(SearchSimilarRequest) returns (SearchSimilarResponse);
+  rpc ListArticles(ListArticlesRequest) returns (ListArticlesResponse);
+}
+
+message Article {
+  string id = 1;
+  string url = 2;
+  string headline = 3;
+  string summary = 4;
+  string content = 5;
+  repeated float vector = 6;
+  int32 shard_id = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message SearchHit {
+  Article article = 1;
+  double score = 2;
+}
+
+message InsertRequest {
+  Article article = 1;
+}
+
+message InsertResponse {}
+
+message GetRequest {
+  string id = 1;
+}
+
+message GetResponse {
+  Article article = 1;
+}
+
+message DeleteRequest {
+  string id = 1;
+}
+
+message DeleteResponse {}
+
+message SearchSimilarRequest {
+  repeated float query = 1;
+  int32 k = 2;
+}
+
+message SearchSimilarResponse {
+  repeated SearchHit hits = 1;
+}
+
+message ListArticlesRequest {}
+
+message ListArticlesResponse {
+  repeated Article articles = 1;
+}

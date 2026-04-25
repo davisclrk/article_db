@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,12 +20,14 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
-	if len(os.Args) > 1 {
-		log.Println("usage: go run ./cmd/coordinator")
+	shardAddrs := flag.String("shard-addrs", "", "Comma-separated gRPC addresses of shard processes (e.g. :9000,:9001,:9002). When set, the coordinator runs in remote mode; when empty, shards run in-process.")
+	flag.Parse()
+	if flag.NArg() > 0 {
+		log.Println("usage: go run ./cmd/coordinator [--shard-addrs :9000,:9001,:9002]")
 		return
 	}
 
+	cfg := config.Load()
 	client := embedding.NewClient(cfg.OpenRouterAPIKey, cfg.EmbeddingModel, cfg.OpenRouterBaseURL, nil)
 
 	numShards := 3
@@ -37,17 +40,32 @@ func main() {
 	if dataDir == "" {
 		dataDir = "./data"
 	}
-	coord, err := coordinator.NewCoordinator(coordinator.Config{
+
+	coordCfg := coordinator.Config{
 		NumShards: numShards,
 		DataDir:   dataDir,
 		NewIndex:  newVectorIndexFromEnv,
-	})
+	}
+
+	addrs := parseShardAddrs(*shardAddrs)
+	if len(addrs) > 0 {
+		if len(addrs) != numShards {
+			log.Fatalf("--shard-addrs has %d entries but ARTICLE_DB_NUM_SHARDS=%d", len(addrs), numShards)
+		}
+		clients, err := dialShards(addrs)
+		if err != nil {
+			log.Fatalf("dial shards: %v", err)
+		}
+		coordCfg.Clients = clients
+	}
+
+	coord, err := coordinator.NewCoordinator(coordCfg)
 	if err != nil {
 		log.Fatalf("coordinator: %v", err)
 	}
 	defer coord.Close()
 
-	printIndexBanner(cfg.EmbeddingModel)
+	printIndexBanner(cfg.EmbeddingModel, addrs)
 	printHelp(os.Stdout)
 
 	session := replSession{
@@ -66,16 +84,51 @@ func newVectorIndexFromEnv() index.VectorIndex {
 	return index.NewHNSWIndex(index.DefaultHNSWConfig())
 }
 
-func printIndexBanner(model string) {
+func parseShardAddrs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func dialShards(addrs []string) (map[int]coordinator.Client, error) {
+	clients := make(map[int]coordinator.Client, len(addrs))
+	for i, addr := range addrs {
+		c, err := coordinator.NewRemoteClient(addr)
+		if err != nil {
+			for _, prev := range clients {
+				_ = prev.Close()
+			}
+			return nil, fmt.Errorf("shard %d at %s: %w", i, addr, err)
+		}
+		clients[i] = c
+	}
+	return clients, nil
+}
+
+func printIndexBanner(model string, shardAddrs []string) {
+	mode := "in-process"
+	if len(shardAddrs) > 0 {
+		mode = fmt.Sprintf("remote shards %v", shardAddrs)
+	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("ARTICLE_DB_INDEX")), "brute") {
-		fmt.Printf("Shard-local index: brute-force (model=%s)\n", model)
+		fmt.Printf("Shard-local index: brute-force (model=%s, mode=%s)\n", model, mode)
 		fmt.Println("Query path: coordinator fanout to shard-local indexes (HNSW default, brute-force optional).")
 		return
 	}
 
 	hcfg := index.DefaultHNSWConfig()
-	fmt.Printf("Shard-local index: HNSW (M=%d, efConstruction=%d, efSearch=%d, model=%s)\n",
-		hcfg.M, hcfg.EfConstruction, hcfg.EfSearch, model)
+	fmt.Printf("Shard-local index: HNSW (M=%d, efConstruction=%d, efSearch=%d, model=%s, mode=%s)\n",
+		hcfg.M, hcfg.EfConstruction, hcfg.EfSearch, model, mode)
 	fmt.Println("Query path: coordinator fanout to shard-local indexes (HNSW default, brute-force optional).")
 }
 
@@ -110,11 +163,11 @@ func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
 		case "get":
-			if err := s.handleGet(strings.TrimSpace(rest), output); err != nil {
+			if err := s.handleGet(ctx, strings.TrimSpace(rest), output); err != nil {
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
 		case "delete":
-			if err := s.handleDelete(strings.TrimSpace(rest), output); err != nil {
+			if err := s.handleDelete(ctx, strings.TrimSpace(rest), output); err != nil {
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
 		case "query":
@@ -122,7 +175,7 @@ func (s *replSession) run(ctx context.Context, input io.Reader, output io.Writer
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
 		case "list":
-			if err := s.handleList(output); err != nil {
+			if err := s.handleList(ctx, output); err != nil {
 				fmt.Fprintf(output, "error: %v\n", err)
 			}
 		case "help":
@@ -166,7 +219,7 @@ func (s *replSession) handleInsert(ctx context.Context, url string, output io.Wr
 		Content:  content,
 		Vector:   vector,
 	}
-	id, err := s.coordinator.Insert(a)
+	id, err := s.coordinator.Insert(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -175,11 +228,11 @@ func (s *replSession) handleInsert(ctx context.Context, url string, output io.Wr
 	return nil
 }
 
-func (s *replSession) handleGet(id string, output io.Writer) error {
+func (s *replSession) handleGet(ctx context.Context, id string, output io.Writer) error {
 	if id == "" {
 		return fmt.Errorf("usage: get <id>")
 	}
-	a, err := s.coordinator.Get(id)
+	a, err := s.coordinator.Get(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -190,11 +243,11 @@ func (s *replSession) handleGet(id string, output io.Writer) error {
 	return nil
 }
 
-func (s *replSession) handleDelete(id string, output io.Writer) error {
+func (s *replSession) handleDelete(ctx context.Context, id string, output io.Writer) error {
 	if id == "" {
 		return fmt.Errorf("usage: delete <id>")
 	}
-	if err := s.coordinator.Delete(id); err != nil {
+	if err := s.coordinator.Delete(ctx, id); err != nil {
 		return err
 	}
 	fmt.Fprintf(output, "deleted %s\n", id)
@@ -217,7 +270,7 @@ func (s *replSession) handleQuery(ctx context.Context, args string, output io.Wr
 		return fmt.Errorf("embedding request failed: %w", err)
 	}
 
-	results, err := s.coordinator.Query(vector, k)
+	results, err := s.coordinator.Query(ctx, vector, k)
 	if err != nil {
 		return err
 	}
@@ -234,8 +287,8 @@ func (s *replSession) handleQuery(ctx context.Context, args string, output io.Wr
 	return nil
 }
 
-func (s *replSession) handleList(output io.Writer) error {
-	articles, err := s.coordinator.ListArticles()
+func (s *replSession) handleList(ctx context.Context, output io.Writer) error {
+	articles, err := s.coordinator.ListArticles(ctx)
 	if err != nil {
 		return err
 	}
@@ -259,5 +312,6 @@ func printHelp(output io.Writer) {
 	fmt.Fprintln(output, "  list               show stored articles across shards")
 	fmt.Fprintln(output, "  help")
 	fmt.Fprintln(output, "  quit")
-	fmt.Fprintln(output, "env: ARTICLE_DB_INDEX=brute|hnsw  ARTICLE_DB_NUM_SHARDS  ARTICLE_DB_DATA_DIR")
+	fmt.Fprintln(output, "flags: --shard-addrs :9000,:9001,:9002 (remote mode; default in-process)")
+	fmt.Fprintln(output, "env:   ARTICLE_DB_INDEX=brute|hnsw  ARTICLE_DB_NUM_SHARDS  ARTICLE_DB_DATA_DIR")
 }
