@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,10 +87,40 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 		}
 	}
 
-	return &Coordinator{
+	c := &Coordinator{
 		shardMap: shardMap,
 		routes:   routes,
-	}, nil
+	}
+	if err := c.initDocIDCounter(context.Background()); err != nil {
+		closeAll(routes)
+		return nil, fmt.Errorf("init doc id counter: %w", err)
+	}
+	return c, nil
+}
+
+func (c *Coordinator) initDocIDCounter(ctx context.Context) error {
+	var maxN uint64
+	for _, route := range c.routes {
+		articles, err := route.ListArticles(ctx)
+		if err != nil {
+			return err
+		}
+		for _, a := range articles {
+			rest, ok := strings.CutPrefix(a.ID, "doc-")
+			if !ok {
+				continue
+			}
+			n, err := strconv.ParseUint(rest, 10, 64)
+			if err != nil {
+				continue
+			}
+			if n > maxN {
+				maxN = n
+			}
+		}
+	}
+	atomic.StoreUint64(&c.nextDocID, maxN)
+	return nil
 }
 
 func (c *Coordinator) Insert(ctx context.Context, article *models.Article) (string, error) {
