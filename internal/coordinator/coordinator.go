@@ -15,17 +15,24 @@ import (
 )
 
 type Coordinator struct {
-	shardMap     *models.ShardMap
-	shardClients map[int]Client
-	mu           sync.RWMutex
-	nextDocID    uint64
+	shardMap  *models.ShardMap
+	routes    map[int]*shardRoute
+	mu        sync.RWMutex
+	nextDocID uint64
+}
+
+type ReplicaSetConfig struct {
+	PrimaryAddr string
+	Primary     Client
+	ReplicaAddr string
+	Replica     Client
 }
 
 type Config struct {
-	NumShards int
-	DataDir   string
-	NewIndex  func() index.VectorIndex
-	Clients map[int]Client
+	NumShards    int
+	DataDir      string
+	NewIndex     func() index.VectorIndex
+	RemoteShards map[int]ReplicaSetConfig
 }
 
 func NewCoordinator(cfg Config) (*Coordinator, error) {
@@ -33,12 +40,13 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 		return nil, fmt.Errorf("num_shards must be positive")
 	}
 
-	clients := cfg.Clients
-	if clients == nil {
+	shardMap := models.NewShardMap(cfg.NumShards)
+	routes := make(map[int]*shardRoute, cfg.NumShards)
+
+	if cfg.RemoteShards == nil {
 		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 			return nil, fmt.Errorf("data dir: %w", err)
 		}
-		clients = make(map[int]Client, cfg.NumShards)
 		for i := 0; i < cfg.NumShards; i++ {
 			dbPath := fmt.Sprintf("%s/shard_%d.db", cfg.DataDir, i)
 			node, err := shard.NewNode(shard.Config{
@@ -48,23 +56,41 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 				NewIndex:  cfg.NewIndex,
 			})
 			if err != nil {
-				closeAll(clients)
+				closeAll(routes)
 				return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
 			}
-			clients[i] = NewLocalClient(node)
+			routes[i] = newLocalShardRoute(i, NewLocalClient(node))
 		}
-	} else if len(clients) != cfg.NumShards {
-		return nil, fmt.Errorf("clients map has %d entries, expected %d", len(clients), cfg.NumShards)
+	} else {
+		if len(cfg.RemoteShards) != cfg.NumShards {
+			return nil, fmt.Errorf("remote shard map has %d entries, expected %d", len(cfg.RemoteShards), cfg.NumShards)
+		}
+		for i := 0; i < cfg.NumShards; i++ {
+			remote, ok := cfg.RemoteShards[i]
+			if !ok {
+				closeAll(routes)
+				return nil, fmt.Errorf("missing remote shard %d", i)
+			}
+			if remote.Primary == nil || remote.Replica == nil {
+				closeAll(routes)
+				return nil, fmt.Errorf("remote shard %d requires both primary and replica clients", i)
+			}
+			if remote.PrimaryAddr == "" || remote.ReplicaAddr == "" {
+				closeAll(routes)
+				return nil, fmt.Errorf("remote shard %d requires both primary and replica addresses", i)
+			}
+			routes[i] = newRemoteShardRoute(i, remote)
+			shardMap.Shards[i].PrimaryAddr = remote.PrimaryAddr
+			shardMap.Shards[i].ReplicaAddr = remote.ReplicaAddr
+		}
 	}
 
 	return &Coordinator{
-		shardMap:     models.NewShardMap(cfg.NumShards),
-		shardClients: clients,
+		shardMap: shardMap,
+		routes:   routes,
 	}, nil
 }
 
-// Insert persists the article on the shard selected by hash(id) % num_shards.
-// If article.ID is empty, a new doc ID is assigned. Returns the stored ID.
 func (c *Coordinator) Insert(ctx context.Context, article *models.Article) (string, error) {
 	if article == nil {
 		return "", fmt.Errorf("article is nil")
@@ -82,26 +108,25 @@ func (c *Coordinator) Insert(ctx context.Context, article *models.Article) (stri
 		article.CreatedAt = time.Now().UTC()
 	}
 
-	client, err := c.clientFor(shardID)
+	route, err := c.routeFor(shardID)
 	if err != nil {
 		return "", err
 	}
-	if err := client.InsertArticle(ctx, article); err != nil {
+	if err := route.InsertArticle(ctx, article); err != nil {
 		return "", err
 	}
 	return id, nil
 }
 
-// Get loads the article from the shard that owns the ID.
 func (c *Coordinator) Get(ctx context.Context, id string) (*models.Article, error) {
 	if id == "" {
 		return nil, fmt.Errorf("id is empty")
 	}
-	client, err := c.clientFor(c.shardMap.GetShardForID(id))
+	route, err := c.routeFor(c.shardMap.GetShardForID(id))
 	if err != nil {
 		return nil, err
 	}
-	a, err := client.GetArticle(ctx, id)
+	a, err := route.GetArticle(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -111,27 +136,17 @@ func (c *Coordinator) Get(ctx context.Context, id string) (*models.Article, erro
 	return a, nil
 }
 
-// Delete removes the article from the owning shard.
 func (c *Coordinator) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("id is empty")
 	}
-	client, err := c.clientFor(c.shardMap.GetShardForID(id))
+	route, err := c.routeFor(c.shardMap.GetShardForID(id))
 	if err != nil {
 		return err
 	}
-	existing, err := client.GetArticle(ctx, id)
-	if err != nil {
-		return err
-	}
-	if existing == nil {
-		return ErrNotFound
-	}
-	return client.DeleteArticle(ctx, id)
+	return route.DeleteArticle(ctx, id)
 }
 
-// Query asks each shard for its local top-k from its shard-local vector index, then merges
-// and deduplicates by article ID before returning the global top-k.
 func (c *Coordinator) Query(ctx context.Context, queryVector []float32, k int) ([]models.SearchResult, error) {
 	if k <= 0 {
 		return nil, fmt.Errorf("k must be positive")
@@ -142,9 +157,9 @@ func (c *Coordinator) Query(ctx context.Context, queryVector []float32, k int) (
 
 	c.mu.RLock()
 	numShards := c.shardMap.NumShards
-	clients := make([]Client, numShards)
+	routes := make([]*shardRoute, numShards)
 	for i := 0; i < numShards; i++ {
-		clients[i] = c.shardClients[i]
+		routes[i] = c.routes[i]
 	}
 	c.mu.RUnlock()
 
@@ -157,7 +172,7 @@ func (c *Coordinator) Query(ctx context.Context, queryVector []float32, k int) (
 		wg.Add(1)
 		go func(shardID int) {
 			defer wg.Done()
-			local, err := clients[shardID].SearchSimilar(ctx, queryVector, k)
+			local, err := routes[shardID].SearchSimilar(ctx, queryVector, k)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -180,15 +195,15 @@ func (c *Coordinator) Query(ctx context.Context, queryVector []float32, k int) (
 func (c *Coordinator) ListArticles(ctx context.Context) ([]*models.Article, error) {
 	c.mu.RLock()
 	numShards := c.shardMap.NumShards
-	clients := make([]Client, numShards)
+	routes := make([]*shardRoute, numShards)
 	for i := 0; i < numShards; i++ {
-		clients[i] = c.shardClients[i]
+		routes[i] = c.routes[i]
 	}
 	c.mu.RUnlock()
 
 	articles := make([]*models.Article, 0)
-	for _, client := range clients {
-		shardArticles, err := client.ListArticles(ctx)
+	for _, route := range routes {
+		shardArticles, err := route.ListArticles(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -204,14 +219,14 @@ func (c *Coordinator) ListArticles(ctx context.Context) ([]*models.Article, erro
 	return articles, nil
 }
 
-func (c *Coordinator) clientFor(shardID int) (Client, error) {
+func (c *Coordinator) routeFor(shardID int) (*shardRoute, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	client, ok := c.shardClients[shardID]
+	route, ok := c.routes[shardID]
 	if !ok {
 		return nil, fmt.Errorf("unknown shard %d", shardID)
 	}
-	return client, nil
+	return route, nil
 }
 
 func mergeSearchResults(partials [][]models.SearchResult, k int) []models.SearchResult {
@@ -243,13 +258,13 @@ func mergeSearchResults(partials [][]models.SearchResult, k int) []models.Search
 func (c *Coordinator) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return closeAll(c.shardClients)
+	return closeAll(c.routes)
 }
 
-func closeAll(clients map[int]Client) error {
+func closeAll(routes map[int]*shardRoute) error {
 	var firstErr error
-	for _, client := range clients {
-		if err := client.Close(); err != nil && firstErr == nil {
+	for _, route := range routes {
+		if err := route.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

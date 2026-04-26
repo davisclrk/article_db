@@ -63,6 +63,12 @@ func (n *Node) SetReplicaAddr(addr string) {
 	n.replicaAddr = addr
 }
 
+func (n *Node) ReplicaAddr() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.replicaAddr
+}
+
 func (n *Node) Close() error {
 	return n.store.Close()
 }

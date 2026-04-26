@@ -11,8 +11,8 @@ The database ingests articles, extracts main text and generates a short summary,
 High-level ingestion flow:
 1. User submits a URL of a news article
 2. Server extracts article text, headline, and creates a short summary (initially implemented as the first N sentences of the article, currently N = 3)
-3. Server constructs `search_text` string and embeds it into a vector utilzing the OpenAI embedding API
-4. Vector + metadata are stored on a shard node (with an exact copy on a replica node, the write will be acknowledged after the primary confirms the write)
+3. Server constructs `search_text` string and embeds it into a vector utilzing the OpenRouter API (utilizing the text-embedding-3-small model)
+4. Vector + metadata are stored on a shard node with an exact copy on a replica node, and the coordinator returns success only after both writes succeed
 
 High-level query flow:
 1. User submits a text query of articles they are interested in
@@ -39,7 +39,7 @@ The system consists of:
   - Execute nearest neighbor search queries for the embedded data
   - Replicate shard data for redundancy
 
-Documents will be assigned to logical shards based on the hash of the document ID modulo the number of shards, i.e. `shard_id = hash(document_id) % num_shards`. Every logical shard will have a primary and a replica node. The coordinator will store a shard map that determines which node holds each shard, as well as a mapping of document IDs to shard IDs. The primary node will write to the replica. Reads will be served from primary nodes, and replicas will only be used for failover. Each shard will use SQLite as its local storage engine. The client only communicates with the coordinator, and shard nodes only communicate with the coordinator and their replicas. 
+Documents will be assigned to logical shards based on the hash of the document ID modulo the number of shards, i.e. `shard_id = hash(document_id) % num_shards`. Every logical shard will have a primary and a replica node. The coordinator stores the shard routing map and writes to primaries. Each primary writes to its replica before acknowledging success. Reads are served from primaries by default. If a primary becomes unavailable, reads for that shard can fail over to the replica, but writes fail until both nodes are available again. Each shard uses SQLite as its local storage engine. The client only communicates with the coordinator.
 
 ---
 

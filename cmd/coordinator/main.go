@@ -20,10 +20,12 @@ import (
 )
 
 func main() {
-	shardAddrs := flag.String("shard-addrs", "", "Comma-separated gRPC addresses of shard processes (e.g. :9000,:9001,:9002). When set, the coordinator runs in remote mode; when empty, shards run in-process.")
+	primaryAddrs := flag.String("primary-addrs", "", "Comma-separated gRPC addresses of primary shard processes in shard-id order.")
+	replicaAddrs := flag.String("replica-addrs", "", "Comma-separated gRPC addresses of replica shard processes in shard-id order.")
+	shardAddrs := flag.String("shard-addrs", "", "Deprecated alias for --primary-addrs.")
 	flag.Parse()
 	if flag.NArg() > 0 {
-		log.Println("usage: go run ./cmd/coordinator [--shard-addrs :9000,:9001,:9002]")
+		log.Println("usage: go run ./cmd/coordinator [--primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005]")
 		return
 	}
 
@@ -47,16 +49,27 @@ func main() {
 		NewIndex:  newVectorIndexFromEnv,
 	}
 
-	addrs := parseShardAddrs(*shardAddrs)
-	if len(addrs) > 0 {
-		if len(addrs) != numShards {
-			log.Fatalf("--shard-addrs has %d entries but ARTICLE_DB_NUM_SHARDS=%d", len(addrs), numShards)
+	primaryRaw := strings.TrimSpace(*primaryAddrs)
+	if primaryRaw == "" {
+		primaryRaw = strings.TrimSpace(*shardAddrs)
+	}
+	primary := parseShardAddrs(primaryRaw)
+	replica := parseShardAddrs(*replicaAddrs)
+	if len(primary) > 0 || len(replica) > 0 {
+		if len(primary) == 0 || len(replica) == 0 {
+			log.Fatalf("remote mode requires both --primary-addrs and --replica-addrs")
 		}
-		clients, err := dialShards(addrs)
+		if len(primary) != numShards {
+			log.Fatalf("--primary-addrs has %d entries but ARTICLE_DB_NUM_SHARDS=%d", len(primary), numShards)
+		}
+		if len(replica) != numShards {
+			log.Fatalf("--replica-addrs has %d entries but ARTICLE_DB_NUM_SHARDS=%d", len(replica), numShards)
+		}
+		remoteShards, err := dialShards(primary, replica)
 		if err != nil {
 			log.Fatalf("dial shards: %v", err)
 		}
-		coordCfg.Clients = clients
+		coordCfg.RemoteShards = remoteShards
 	}
 
 	coord, err := coordinator.NewCoordinator(coordCfg)
@@ -65,7 +78,7 @@ func main() {
 	}
 	defer coord.Close()
 
-	printIndexBanner(cfg.EmbeddingModel, addrs)
+	printIndexBanner(cfg.EmbeddingModel, primary, replica)
 	printHelp(os.Stdout)
 
 	session := replSession{
@@ -100,25 +113,45 @@ func parseShardAddrs(raw string) []string {
 	return out
 }
 
-func dialShards(addrs []string) (map[int]coordinator.Client, error) {
-	clients := make(map[int]coordinator.Client, len(addrs))
-	for i, addr := range addrs {
-		c, err := coordinator.NewRemoteClient(addr)
+func dialShards(primaryAddrs, replicaAddrs []string) (map[int]coordinator.ReplicaSetConfig, error) {
+	remoteShards := make(map[int]coordinator.ReplicaSetConfig, len(primaryAddrs))
+	for i := range primaryAddrs {
+		primaryClient, err := coordinator.NewRemoteClient(primaryAddrs[i])
 		if err != nil {
-			for _, prev := range clients {
-				_ = prev.Close()
-			}
-			return nil, fmt.Errorf("shard %d at %s: %w", i, addr, err)
+			closeReplicaSets(remoteShards)
+			return nil, fmt.Errorf("primary shard %d at %s: %w", i, primaryAddrs[i], err)
 		}
-		clients[i] = c
+		replicaClient, err := coordinator.NewRemoteClient(replicaAddrs[i])
+		if err != nil {
+			_ = primaryClient.Close()
+			closeReplicaSets(remoteShards)
+			return nil, fmt.Errorf("replica shard %d at %s: %w", i, replicaAddrs[i], err)
+		}
+		remoteShards[i] = coordinator.ReplicaSetConfig{
+			PrimaryAddr: primaryAddrs[i],
+			Primary:     primaryClient,
+			ReplicaAddr: replicaAddrs[i],
+			Replica:     replicaClient,
+		}
 	}
-	return clients, nil
+	return remoteShards, nil
 }
 
-func printIndexBanner(model string, shardAddrs []string) {
+func closeReplicaSets(remoteShards map[int]coordinator.ReplicaSetConfig) {
+	for _, remote := range remoteShards {
+		if remote.Primary != nil {
+			_ = remote.Primary.Close()
+		}
+		if remote.Replica != nil {
+			_ = remote.Replica.Close()
+		}
+	}
+}
+
+func printIndexBanner(model string, primaryAddrs, replicaAddrs []string) {
 	mode := "in-process"
-	if len(shardAddrs) > 0 {
-		mode = fmt.Sprintf("remote shards %v", shardAddrs)
+	if len(primaryAddrs) > 0 || len(replicaAddrs) > 0 {
+		mode = fmt.Sprintf("remote primaries %v replicas %v", primaryAddrs, replicaAddrs)
 	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("ARTICLE_DB_INDEX")), "brute") {
 		fmt.Printf("Shard-local index: brute-force (model=%s, mode=%s)\n", model, mode)
@@ -312,6 +345,6 @@ func printHelp(output io.Writer) {
 	fmt.Fprintln(output, "  list               show stored articles across shards")
 	fmt.Fprintln(output, "  help")
 	fmt.Fprintln(output, "  quit")
-	fmt.Fprintln(output, "flags: --shard-addrs :9000,:9001,:9002 (remote mode; default in-process)")
+	fmt.Fprintln(output, "flags: --primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005 (remote mode; default in-process)")
 	fmt.Fprintln(output, "env:   ARTICLE_DB_INDEX=brute|hnsw  ARTICLE_DB_NUM_SHARDS  ARTICLE_DB_DATA_DIR")
 }

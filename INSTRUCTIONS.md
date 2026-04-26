@@ -2,8 +2,9 @@
 
 ## Current Project State
 - The REPL in `cmd/coordinator` is fully end-to-end: insert/get/delete/query/list, with SQLite persistence per shard.
-- `cmd/shard` is a real gRPC server. The coordinator can talk to it via `--shard-addrs`, or run shards in-process by default.
-- Still scaffolded only: replication (R=2), failover, HTTP API.
+- `cmd/shard` is a real gRPC server. The coordinator can talk to remote shard primaries and replicas via `--primary-addrs` and `--replica-addrs`, or run shards in-process by default.
+- Remote mode now does synchronous replication with strict write acknowledgment and passive read failover.
+- The REPL in `cmd/coordinator` is the client interface -- there is no separate HTTP/GUI client
 
 ## Safe Build and Test Commands
 - Compile everything: `go build ./...`
@@ -16,8 +17,8 @@
 
 ## Main Runnable Entry Points
 - REPL coordinator (in-process shards, default): `go run ./cmd/coordinator`
-- REPL coordinator (remote shards): `go run ./cmd/coordinator --shard-addrs :9000,:9001,:9002`
-- Shard gRPC server: `go run ./cmd/shard --shard-id 0 --addr :9000 --db-path ./data/shard_0.db`
+- REPL coordinator (remote shards): `go run ./cmd/coordinator --primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005`
+- Shard gRPC server: `go run ./cmd/shard --shard-id 0 --primary=true --addr :9000 --replica-addr :9001 --db-path ./data/shard_0_primary.db`
 
 ## How To Run The Working Path (in-process)
 1. Create a `.env` file in the repo root or export environment variables.
@@ -40,13 +41,17 @@
 
 ## How To Run The Distributed Path (remote shards)
 1. Set the same env vars as above (the coordinator embeds queries; shards do not need `OPENROUTER_*`).
-2. Start one shard process per shard id (in separate terminals or backgrounded):
-   - `go run ./cmd/shard --shard-id 0 --addr :9000 --db-path ./data/shard_0.db`
-   - `go run ./cmd/shard --shard-id 1 --addr :9001 --db-path ./data/shard_1.db`
-   - `go run ./cmd/shard --shard-id 2 --addr :9002 --db-path ./data/shard_2.db`
+2. Start one primary and one replica shard process per logical shard:
+   - `go run ./cmd/shard --shard-id 0 --primary=true --addr :9000 --replica-addr :9001 --db-path ./data/shard_0_primary.db`
+   - `go run ./cmd/shard --shard-id 0 --primary=false --addr :9001 --db-path ./data/shard_0_replica.db`
+   - `go run ./cmd/shard --shard-id 1 --primary=true --addr :9002 --replica-addr :9003 --db-path ./data/shard_1_primary.db`
+   - `go run ./cmd/shard --shard-id 1 --primary=false --addr :9003 --db-path ./data/shard_1_replica.db`
+   - `go run ./cmd/shard --shard-id 2 --primary=true --addr :9004 --replica-addr :9005 --db-path ./data/shard_2_primary.db`
+   - `go run ./cmd/shard --shard-id 2 --primary=false --addr :9005 --db-path ./data/shard_2_replica.db`
 3. Start the coordinator pointing at them:
-   - `go run ./cmd/coordinator --shard-addrs :9000,:9001,:9002`
-4. The number of `--shard-addrs` entries must match `ARTICLE_DB_NUM_SHARDS` (default 3).
+   - `go run ./cmd/coordinator --primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005`
+4. The number of `--primary-addrs` and `--replica-addrs` entries must each match `ARTICLE_DB_NUM_SHARDS` (default 3).
+5. The coordinator writes only to primaries. Each primary writes to its replica before success is returned. If a primary becomes unavailable, reads can fail over to the replica, but writes to that shard fail until both nodes are available again.
 
 ## Commands:
 - `insert <url>` fetches the article, summarizes (first 3 sentences), embeds the headline+summary, and stores on the shard chosen by `hash(id) % num_shards`.
@@ -56,4 +61,4 @@
 ## SQLite Notes
 - The shard/storage path uses `github.com/mattn/go-sqlite3`, so builds that include shard/storage need CGO support.
 - In-process REPL mode imports SQLite transitively (the coordinator constructs `*shard.Node`s) and needs CGO.
-- Remote mode keeps SQLite isolated to the shard binary; the coordinator binary itself does not need CGO when only `--shard-addrs` is used.
+- Remote mode keeps SQLite isolated to the shard binary; the coordinator binary itself does not need CGO when only `--primary-addrs` and `--replica-addrs` are used.
