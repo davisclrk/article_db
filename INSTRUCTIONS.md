@@ -9,18 +9,16 @@
 ## Safe Build and Test Commands
 - Compile everything: `go build ./...`
 - `make build` (also runs `go mod tidy` and produces `bin/coordinator` + `bin/shard`).
-- `go test ./...` is currently just a compile check — there are no real tests yet.
 
 ## Proto / gRPC Codegen
 - Schema: `internal/shardpb/shard.proto`. Generated stubs (`shard.pb.go`, `shard_grpc.pb.go`) live next to it and are committed.
 - Regenerate: `make proto`. This auto-installs `protoc-gen-go` and `protoc-gen-go-grpc` into `$(go env GOPATH)/bin` if missing. `protoc` itself must already be on PATH.
 
 ## Main Runnable Entry Points
-- REPL coordinator (in-process shards, default): `go run ./cmd/coordinator`
 - REPL coordinator (remote shards): `go run ./cmd/coordinator --primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005`
 - Shard gRPC server: `go run ./cmd/shard --shard-id 0 --primary=true --addr :9000 --replica-addr :9001 --db-path ./data/shard_0_primary.db`
 
-## How To Run The Working Path (in-process)
+## How To Run The Distributed Path (remote shards)
 1. Create a `.env` file in the repo root or export environment variables.
 2. Required env var: `OPENROUTER_API_KEY`
 3. Optional env vars:
@@ -29,8 +27,18 @@
    - `ARTICLE_DB_NUM_SHARDS` default: `3`
    - `ARTICLE_DB_DATA_DIR` default: `./data`
    - `ARTICLE_DB_INDEX` `brute` or `hnsw` (default `hnsw`)
-4. Start the REPL: `go run ./cmd/coordinator`
-5. Use these commands inside the REPL:
+4. Start one primary and one replica shard process per logical shard:
+   - `go run ./cmd/shard --shard-id 0 --primary=true --addr :9000 --replica-addr :9001 --db-path ./data/shard_0_primary.db`
+   - `go run ./cmd/shard --shard-id 0 --primary=false --addr :9001 --db-path ./data/shard_0_replica.db`
+   - `go run ./cmd/shard --shard-id 1 --primary=true --addr :9002 --replica-addr :9003 --db-path ./data/shard_1_primary.db`
+   - `go run ./cmd/shard --shard-id 1 --primary=false --addr :9003 --db-path ./data/shard_1_replica.db`
+   - `go run ./cmd/shard --shard-id 2 --primary=true --addr :9004 --replica-addr :9005 --db-path ./data/shard_2_primary.db`
+   - `go run ./cmd/shard --shard-id 2 --primary=false --addr :9005 --db-path ./data/shard_2_replica.db`
+5. Start the coordinator pointing at them:
+   - `go run ./cmd/coordinator --primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005`
+6. The number of `--primary-addrs` and `--replica-addrs` entries must each match `ARTICLE_DB_NUM_SHARDS` (default 3).
+7. The coordinator writes only to primaries. Each primary writes to its replica before success is returned. If a primary becomes unavailable, reads can fail over to the replica, but writes to that shard fail until both nodes are available again.
+8. Use these commands inside the REPL:
    - `insert <url>`
    - `get <id>`
    - `delete <id>`
@@ -38,20 +46,6 @@
    - `list`
    - `help`
    - `quit`
-
-## How To Run The Distributed Path (remote shards)
-1. Set the same env vars as above (the coordinator embeds queries; shards do not need `OPENROUTER_*`).
-2. Start one primary and one replica shard process per logical shard:
-   - `go run ./cmd/shard --shard-id 0 --primary=true --addr :9000 --replica-addr :9001 --db-path ./data/shard_0_primary.db`
-   - `go run ./cmd/shard --shard-id 0 --primary=false --addr :9001 --db-path ./data/shard_0_replica.db`
-   - `go run ./cmd/shard --shard-id 1 --primary=true --addr :9002 --replica-addr :9003 --db-path ./data/shard_1_primary.db`
-   - `go run ./cmd/shard --shard-id 1 --primary=false --addr :9003 --db-path ./data/shard_1_replica.db`
-   - `go run ./cmd/shard --shard-id 2 --primary=true --addr :9004 --replica-addr :9005 --db-path ./data/shard_2_primary.db`
-   - `go run ./cmd/shard --shard-id 2 --primary=false --addr :9005 --db-path ./data/shard_2_replica.db`
-3. Start the coordinator pointing at them:
-   - `go run ./cmd/coordinator --primary-addrs :9000,:9002,:9004 --replica-addrs :9001,:9003,:9005`
-4. The number of `--primary-addrs` and `--replica-addrs` entries must each match `ARTICLE_DB_NUM_SHARDS` (default 3).
-5. The coordinator writes only to primaries. Each primary writes to its replica before success is returned. If a primary becomes unavailable, reads can fail over to the replica, but writes to that shard fail until both nodes are available again.
 
 ## Commands:
 - `insert <url>` fetches the article, summarizes (first 3 sentences), embeds the headline+summary, and stores on the shard chosen by `hash(id) % num_shards`.
