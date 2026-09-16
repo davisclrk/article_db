@@ -141,11 +141,9 @@ func (h *HNSWIndex) Insert(id, text string, vector []float32) error {
 	for lc := topLevel; lc >= 0; lc-- {
 		candidates := h.searchLayer(vector, norm, ep, h.efConst, lc)
 
-		mMax := h.m
-		if lc == 0 {
-			mMax = h.mmax0
-		}
-		selected := h.selectNeighborsSimple(candidates, mMax)
+		// The new node gets at most M links on every layer. mmax0 is only the
+		// cap enforced on existing layer-0 neighbor lists when they overflow.
+		selected := h.selectNeighbors(vector, norm, candidates, h.m)
 
 		h.nodes[nodeIdx].connections[lc] = make([]int, len(selected))
 		for i, s := range selected {
@@ -328,34 +326,59 @@ func (h *HNSWIndex) searchLayer(query []float32, queryNorm float64, ep int, ef i
 	return out
 }
 
-func (h *HNSWIndex) selectNeighborsSimple(candidates []candidate, m int) []candidate {
-	if len(candidates) <= m {
-		return candidates
-	}
-	return candidates[:m]
-}
-
-func (h *HNSWIndex) pruneConnections(nodeID int, connections []int, maxConns int) []int {
-	node := &h.nodes[nodeID]
-	type scored struct {
-		id  int
-		sim float64
-	}
-	items := make([]scored, len(connections))
-	for i, connID := range connections {
-		items[i] = scored{
-			id:  connID,
-			sim: cosineSimilarity(node.record.Vector, node.norm, h.nodes[connID].record.Vector, h.nodes[connID].norm),
+// selectNeighbors is the neighbor-selection heuristic from the HNSW paper
+// (Malkov & Yashunin, Algorithm 4). Candidates must be sorted by decreasing
+// similarity to q. A candidate is kept only if it is closer to q than to every
+// neighbor already kept, so the selected links spread out in different
+// directions instead of piling up on one side of q.
+//
+// The simpler rule of keeping the m nearest candidates breaks on clustered
+// data: once a cluster holds more than m nodes, every node's m nearest are
+// inside its own cluster, the links to other clusters get pruned away, and
+// layer 0 splits into islands that search can never cross. Recall then stops
+// improving no matter how large efSearch is.
+func (h *HNSWIndex) selectNeighbors(q []float32, qNorm float64, candidates []candidate, m int) []candidate {
+	selected := make([]candidate, 0, m)
+	for _, e := range candidates {
+		if len(selected) >= m {
+			break
+		}
+		eNode := &h.nodes[e.id]
+		closerToSelected := false
+		for _, r := range selected {
+			rNode := &h.nodes[r.id]
+			if cosineSimilarity(eNode.record.Vector, eNode.norm, rNode.record.Vector, rNode.norm) > e.similarity {
+				closerToSelected = true
+				break
+			}
+		}
+		if !closerToSelected {
+			selected = append(selected, e)
 		}
 	}
-	sort.Slice(items, func(a, b int) bool {
-		return items[a].sim > items[b].sim
-	})
-	result := make([]int, maxConns)
-	for i := 0; i < maxConns; i++ {
-		result[i] = items[i].id
+	return selected
+}
+
+// pruneConnections shrinks a node's neighbor list to at most maxConns using the
+// same heuristic as selectNeighbors, with the node itself as the query.
+func (h *HNSWIndex) pruneConnections(nodeID int, connections []int, maxConns int) []int {
+	node := &h.nodes[nodeID]
+	cands := make([]candidate, len(connections))
+	for i, connID := range connections {
+		cands[i] = candidate{
+			id:         connID,
+			similarity: cosineSimilarity(node.record.Vector, node.norm, h.nodes[connID].record.Vector, h.nodes[connID].norm),
+		}
 	}
-	return result
+	sort.Slice(cands, func(a, b int) bool {
+		return cands[a].similarity > cands[b].similarity
+	})
+	selected := h.selectNeighbors(node.record.Vector, node.norm, cands, maxConns)
+	out := make([]int, len(selected))
+	for i, s := range selected {
+		out[i] = s.id
+	}
+	return out
 }
 
 func (h *HNSWIndex) nodeConnections(nodeID int, layer int) []int {
